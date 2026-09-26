@@ -3,7 +3,7 @@ import random
 from pathlib import Path
 
 import fitz  # PyMuPDF
-
+# make the more sample done again it choose from what not chosen before, so it is not the same as the previous one, but it is still random
 
 TEMPLATE = """<MAIN>
 النص الأساسي
