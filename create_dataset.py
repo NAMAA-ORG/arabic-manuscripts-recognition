@@ -7,7 +7,7 @@ from typing import Optional
 
 # ================= CONFIGURATION =================
 INPUT_DIR = Path("Files_demo")
-OUTPUT_CSV = Path("dataset.csv")
+OUTPUT_CSV = Path("dataset_relative.csv")
 
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"
@@ -47,7 +47,7 @@ def normalize_arabic(text: str) -> str:
 def extract_main_text(txt_path: Path) -> Optional[str]:
     """Extract the content enclosed by <MAIN> and </MAIN>."""
     try:
-        content = txt_path.read_text(encoding="utf-8-sig")
+        content = txt_path.read_text(encoding="utf-8-sig", errors="ignore")
     except (OSError, UnicodeError) as exc:
         print(f"[WARNING] Cannot read {txt_path}: {exc}")
         return None
@@ -115,7 +115,8 @@ def prepare_dataset():
             continue
 
         for image_path in images:
-            resolved_path = str(image_path.resolve())
+            # resolved_path = str(image_path.resolve())
+            resolved_path = "Files_demo\\"+str(image_path.relative_to(INPUT_DIR))
 
             if resolved_path in seen_images:
                 print(f"[WARNING] Duplicate image skipped: {image_path}")
