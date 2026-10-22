@@ -3,7 +3,7 @@
 
 """QLoRA fine-tuning of a vision-language model (default: Gemma 4 E4B) for manuscript OCR.
 
-Built for Kaggle (2x T4). Training runs on GPU 0; evaluation uses inference.run()
+Built for Kaggle (2x T4). Training runs on GPU 0; evaluation uses inference_multiple_vlms.run()
 on both GPUs, so validation CER is directly comparable with the benchmark.
 
 Trains on the NAMAA pages of this repository only (dataset_relative.csv) and scores
@@ -13,21 +13,22 @@ Validation split (--split):
     page  --val_per_doc pages from every group (default; same hands/books in train and val)
     doc   whole groups held out (harder: tests transfer to unseen hands/books)
 
-Every epoch's adapter is scored by CER on the validation pages, and the epoch with the
-lowest corpus CER is copied to lora_namaa_best (validation loss did not predict CER).
+The validation loss is computed after every epoch; the adapter of the epoch with the
+lowest validation loss is saved as lora_namaa_best, and only that adapter is scored by
+CER on the validation pages (one inference pass instead of one per epoch).
 
 Usage:
-    python finetune_namaa.py --csv dataset_relative.csv --root . -o lora_out
-    python finetune_namaa.py --csv dataset_relative.csv --root . --epochs 2 --no_baseline
+    python finetune-lora.py --csv dataset_relative.csv --root . -o lora_out
+    python finetune-lora.py --csv dataset_relative.csv --root . --epochs 2 --no_baseline
 
 Outputs (in --output):
-    lora_namaa_ep<N>/, lora_namaa_best/            LoRA adapters (peft)
-    results_<preset>-val-base.csv                  baseline CER on the validation pages
-    results_<preset>-val-lora-namaa-ep<N>.csv    CER of each epoch's adapter
-    epoch_scores.csv, train_history.csv, split.csv, val.csv
+    lora_namaa_ep<N>/, lora_namaa_best/       LoRA adapters (peft)
+    results_<preset>-val-base.csv             baseline CER on the validation pages
+    results_<preset>-val-lora-namaa.csv       CER of the best adapter
+    train_history.csv, split.csv, val.csv
 
 Use an adapter afterwards:
-    python inference.py --preset gemma4-e4b --quant 4bit --device_map per-gpu --adapter lora_out/lora_namaa_best
+    python inference_multiple_vlms.py --preset gemma4-e4b --quant 4bit --device_map per-gpu --adapter lora_out/lora_namaa_best
 """
 
 import argparse
@@ -36,7 +37,6 @@ import math
 import os
 import random
 import re
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -49,7 +49,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import inference as K  # noqa: E402
+import inference_multiple_vlms as K  # noqa: E402
 
 
 # LoRA is applied to these projections of the language model only (vision / audio stay frozen)
@@ -153,8 +153,9 @@ def eval_overrides(args):
 
 
 def train_run(name, frame, val_df, args):
-    """Train one LoRA adapter on `frame` (img, text) and save lora_<name>_ep<N> after every epoch.
-    Returns the per-epoch history (epoch 0 = the base model's validation loss)."""
+    """Train one LoRA adapter on `frame` (img, text) and save lora_<name>_ep<N> after every epoch;
+    the epoch with the lowest validation loss is also saved as lora_<name>_best.
+    Returns the per-epoch history (epoch 0 = the base model's validation loss) and the best epoch."""
     from peft import LoraConfig, get_peft_model
 
     random.seed(args.seed)
@@ -224,7 +225,7 @@ def train_run(name, frame, val_df, args):
                 losses.append(loss.item())
         return sum(losses) / max(1, len(losses))
 
-    t0, history = time.time(), []
+    t0, history, best_loss, best_epoch = time.time(), [], float("inf"), None
 
     # LoRA starts as a no-op, so this is the base model's validation loss
     vl = val_loss()
@@ -287,11 +288,15 @@ def train_run(name, frame, val_df, args):
         print(f"[{name}] epoch {epoch + 1}/{args.epochs}  train {running / max(1, counted):.4f}  "
               f"val {vl:.4f}  skipped {skipped}  {(time.time() - t0) / 60:.0f} min")
         model.save_pretrained(f"lora_{name}_ep{epoch + 1}")
+        if vl < best_loss:
+            best_loss, best_epoch = vl, epoch + 1
+            model.save_pretrained(f"lora_{name}_best")
+            print(f"  saved lora_{name}_best (epoch {best_epoch})")
 
     del model, ocr, optimizer, params, scaler, scheduler, sample
     gc.collect()
-    torch.cuda.empty_cache()  # inference.run() needs both GPUs free
-    return history
+    torch.cuda.empty_cache()  # inference_multiple_vlms.run() needs both GPUs free
+    return history, best_epoch
 
 
 def val_cer(tag):
@@ -303,23 +308,12 @@ def val_cer(tag):
     return corpus, d.cer.median(), int((d.cer > 1).sum())
 
 
-def score_epochs(name, val_csv, root, args):
-    """Score every epoch's adapter by CER on the validation pages; copy the best to lora_<name>_best."""
-    scores = []
-    for epoch in (args.eval_epochs or range(1, args.epochs + 1)):
-        tag = f"{args.preset}-val-lora-{name}-ep{epoch}"
-        K.run(args.preset, csv=str(val_csv), root=str(root), tag=tag,
-              adapter=os.path.abspath(f"lora_{name}_ep{epoch}"), **eval_overrides(args))
-        corpus, median, loops = val_cer(tag)
-        scores.append({"run": name, "epoch": epoch, "corpus_cer": corpus,
-                       "median_cer": median, "pages_cer>1": loops})
-        print(f"[{name}] ep{epoch}: corpus CER {corpus:.4f}  median {median:.4f}  pages>1 {loops}")
-
-    best = min(scores, key=lambda s: s["corpus_cer"])
-    shutil.rmtree(f"lora_{name}_best", ignore_errors=True)
-    shutil.copytree(f"lora_{name}_ep{best['epoch']}", f"lora_{name}_best")
-    print(f"[{name}] best epoch {best['epoch']} -> lora_{name}_best")
-    return scores
+def evaluate_best(name, val_csv, root, args):
+    """Score lora_<name>_best by CER on the validation pages (both GPUs)."""
+    tag = f"{args.preset}-val-lora-{name}"
+    K.run(args.preset, csv=str(val_csv), root=str(root), tag=tag,
+          adapter=os.path.abspath(f"lora_{name}_best"), **eval_overrides(args))
+    return val_cer(tag)
 
 
 # ================= MAIN =================
@@ -329,12 +323,12 @@ def finetune(args):
     root = Path(args.root).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    os.chdir(output_dir)  # inference.run() / compare() read and write results_*.csv here
+    os.chdir(output_dir)  # run() / compare() read and write results_*.csv here
 
     random.seed(args.seed)
     train_df, val_df = load_namaa(csv_path, root, args.split, args.val_per_doc, args.val_frac, args.seed)
 
-    # What inference.run() reads, plus a record of the split
+    # What inference_multiple_vlms.run() reads, plus a record of the split
     val_csv = output_dir / "val.csv"
     val_df[["path", "main_text"]].to_csv(val_csv, index=False, encoding="utf-8-sig")
     pd.concat([
@@ -346,14 +340,15 @@ def finetune(args):
         K.run(args.preset, csv=str(val_csv), root=str(root), tag=f"{args.preset}-val-base", **eval_overrides(args))
 
     t0 = time.time()
-    histories = train_run("namaa", train_df[["img", "text", "doc"]], val_df, args)
-    pd.DataFrame(histories).to_csv("train_history.csv", index=False)
-    scores = score_epochs("namaa", val_csv, root, args)
-    pd.DataFrame(scores).to_csv("epoch_scores.csv", index=False)
-    print(f"=== done, total {(time.time() - t0) / 60:.0f} min ===\n")
+    history, best_epoch = train_run("namaa", train_df[["img", "text", "doc"]], val_df, args)
+    pd.DataFrame(history).to_csv("train_history.csv", index=False)
+    print(pd.DataFrame(history).to_string(index=False))
+    if best_epoch is None:
+        raise RuntimeError("No epoch produced a finite validation loss; nothing to evaluate")
 
-    merged = pd.DataFrame(histories).merge(pd.DataFrame(scores), on=["run", "epoch"], how="left")
-    print(merged.to_string(index=False))
+    corpus, median, loops = evaluate_best("namaa", val_csv, root, args)
+    print(f"=== done, total {(time.time() - t0) / 60:.0f} min ===\n")
+    print(f"best (epoch {best_epoch}): corpus CER {corpus:.4f}  median {median:.4f}  pages>1 {loops}")
     if os.path.exists(f"results_{args.preset}-val-base.csv"):
         corpus, median, loops = val_cer(f"{args.preset}-val-base")
         print(f"baseline: corpus CER {corpus:.4f}  median {median:.4f}  pages>1 {loops}")
@@ -372,8 +367,8 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", default="lora_output", help="Output directory (default: lora_output)")
     parser.add_argument("--split", default="page", choices=["page", "doc"],
                         help="page: --val_per_doc pages from every group; doc: whole groups held out (default: page)")
-    parser.add_argument("--val_per_doc", type=int, default=4,
-                        help="Validation pages per group with --split page (default: 4)")
+    parser.add_argument("--val_per_doc", type=int, default=2,
+                        help="Validation pages per group with --split page (default: 2)")
     parser.add_argument("--val_frac", type=float, default=0.25,
                         help="Share of NAMAA pages held out with --split doc (default: 0.25)")
     parser.add_argument("--max_seq", type=int, default=4096,
@@ -381,7 +376,7 @@ if __name__ == "__main__":
 
     # Model
     parser.add_argument("--preset", default="gemma4-e4b", choices=sorted(K.PRESETS),
-                        help="Model preset from inference.py (default: gemma4-e4b)")
+                        help="Model preset from inference_multiple_vlms.py (default: gemma4-e4b)")
     parser.add_argument("--quant", default="4bit", choices=["none", "4bit", "8bit"], help="(default: 4bit)")
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "fp32"],
                         help="Use fp32 if the loss keeps going non-finite (default: fp16)")
@@ -392,8 +387,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     parser.add_argument("--epochs", type=int, default=4, help="(default: 4)")
     parser.add_argument("--accum", type=int, default=2, help="Gradient accumulation steps, batch size 1 (default: 2)")
-    parser.add_argument("--eval_epochs", type=int, nargs="+",
-                        help="Epochs whose adapter is scored by CER (default: all)")
     parser.add_argument("--lora_r", type=int, default=16, help="(default: 16)")
     parser.add_argument("--lora_alpha", type=int, default=32, help="(default: 32)")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="(default: 0.05)")

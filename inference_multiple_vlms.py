@@ -7,13 +7,13 @@ model copy on each GPU and splits the pages between them (one worker process
 per GPU), which roughly doubles throughput.
 
 Shell:
-    python inference.py --list
-    python inference.py --preset qari --csv dataset_relative.csv --root .
-    python inference.py --preset gemma4-e4b --quant 4bit --device_map per-gpu --tag gemma4-e4b-4bit
-    python inference.py --compare
+    python inference_multiple_vlms.py --list
+    python inference_multiple_vlms.py --preset qari --csv dataset_relative.csv --root .
+    python inference_multiple_vlms.py --preset gemma4-e4b --quant 4bit --device_map per-gpu --tag gemma4-e4b-4bit
+    python inference_multiple_vlms.py --compare
 
 Python:
-    import inference as K
+    import inference_multiple_vlms as K
     ocr = K.OCR("qari", gpu=0); print(ocr.transcribe("page.png")); ocr.free()
     K.run("qari", csv="dataset_relative.csv", root=".")
     K.compare()
